@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <drm_fourcc.h>
 #include <string.h>
+#include <stdbool.h>
 
 #define fovt_p(format, args...)\
     do {\
@@ -184,6 +185,7 @@ struct drmLocalReq {
     drmModeObjectProperties *object_props;
     drmModeAtomicReq *atomic_req;
     drmModeCrtc *mode_crtc;
+    drmModeEncoder *mode_encoder;
     drmModeModeInfo *modes;
     uint32_t conn_id;
     uint32_t crtc_id;
@@ -237,15 +239,12 @@ static int gbm_map(struct gbm_bo *gbm_bo, bool enable_write, void **addr, void *
 // render
 static uint32_t compute_color(int x, int y, int w, int h);
 
-
-
-
-
 // gem handle
 int CloseHandle(int fd, uint32_t gem_handle);
 
-// atomic
+// display and atomic
 static uint32_t get_property_id(int fd, drmModeObjectProperties *object_props, const char *name);
+static int find_display_configuration(int fd, struct drmLocalReq *req);
 
 int main(int argc, char **argv)
 {
@@ -258,13 +257,16 @@ int main(int argc, char **argv)
     fovt_p("v->name = %s",v->name);
 
     // drmLocalReq
+    /* use find_display_configuration instead */
     // drm_info --> crtc 80 -> conn 255
-    drmlocalreq.mode_res = drmModeGetResources(card_fd);
-    drmlocalreq.crtc_id = drmlocalreq.mode_res->crtcs[0];
-    drmlocalreq.conn_id = drmlocalreq.mode_res->connectors[2];
-    drmlocalreq.mode_conn = drmModeGetConnector(card_fd,drmlocalreq.conn_id);
-    drmlocalreq.modes = drmlocalreq.mode_conn->modes;
+    // drmlocalreq.mode_res = drmModeGetResources(card_fd);
+    // drmlocalreq.crtc_id = drmlocalreq.mode_res->crtcs[0];
+    // drmlocalreq.conn_id = drmlocalreq.mode_res->connectors[2];
+    // drmlocalreq.mode_conn = drmModeGetConnector(card_fd,drmlocalreq.conn_id);
+    // drmlocalreq.modes = drmlocalreq.mode_conn->modes;
     //fovt_p("crtc_id = %d conn_id = %d\n", drmlocalreq.crtc_id, drmlocalreq.conn_id);
+    /* basic link */
+    find_display_configuration(card_fd, &drmlocalreq);
     fovt_p("%s available mode: %d x %d\n", drmlocalreq.modes[0].name, drmlocalreq.modes[0].hdisplay, drmlocalreq.modes[0].vdisplay);
 
     drmSetClientCap(card_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
@@ -282,7 +284,7 @@ int main(int argc, char **argv)
     drmModeFreeObjectProperties(drmlocalreq.object_props);
 
     drmModeCreatePropertyBlob(card_fd, &drmlocalreq.mode_conn->modes[0], sizeof(drmlocalreq.mode_conn->modes[0]),
-                              &drmlocalreq.blob_id);
+            &drmlocalreq.blob_id);
 
     /* get plane properties */
     drmlocalreq.object_props = drmModeObjectGetProperties(card_fd, drmlocalreq.plane_id, DRM_MODE_OBJECT_PLANE);
@@ -330,7 +332,7 @@ int main(int argc, char **argv)
     //(0xFF << 24) | (r << 16) | (g << 8) | b;
     for (uint32_t y = 0; y < handle.height; y++) {
         for (uint32_t x = 0; x < handle.width; x++) {
-            pixel[y * (handle.stride / pixel_size) + x] = 0x1 << 23 | compute_color(x, y, handle.width, handle.height);
+            pixel[y * (handle.stride / pixel_size) + x] = 0x1 << 24 | compute_color(x, y, handle.width, handle.height);
         }
     }
     gbm_bo_unmap(gbm_module.gbm_bo, map_data);
@@ -391,6 +393,7 @@ int main(int argc, char **argv)
     getchar();
 
     // destroy commit req
+    drmModeFreeEncoder(drmlocalreq.mode_encoder);
     drmModeFreeConnector(drmlocalreq.mode_conn);
     drmModeFreePlaneResources(drmlocalreq.plane_res);
     drmModeFreeResources(drmlocalreq.mode_res);
@@ -422,13 +425,81 @@ int main(int argc, char **argv)
     return 0;
 }
 
+static drmModeConnector *find_connector(int fd, drmModeRes *resources) {
+    // iterate the connectors
+    for (int i = 0; i < resources->count_connectors; i++) {
+        drmModeConnector *connector =
+            drmModeGetConnector(fd, resources->connectors[i]);
+        // pick the first connected connector
+        if (connector->connection == DRM_MODE_CONNECTED) {
+            return connector;
+        }
+        drmModeFreeConnector(connector);
+    }
+    // no connector found
+    return NULL;
+}
+
+static drmModeEncoder *find_encoder(int fd, drmModeRes *resources,
+                                    drmModeConnector *connector) {
+  if (connector->encoder_id) {
+    return drmModeGetEncoder(fd, connector->encoder_id);
+  }
+  // no encoder found
+  return NULL;
+}
+
+static int find_display_configuration(int fd, struct drmLocalReq *req)
+{
+    req->mode_res = drmModeGetResources(fd);
+    // find a connector
+    req->mode_conn = find_connector(fd, req->mode_res);
+    if (!req->mode_conn)
+    {
+        fovt_p("No Connector Found!\r\n");
+        goto no_conn;
+    }
+
+    // save the connector_id
+    req->conn_id = req->mode_conn->connector_id;
+    // save the mode
+    req->modes = req->mode_conn->modes;
+    // find an encoder
+    req->mode_encoder = find_encoder(fd, req->mode_res, req->mode_conn);
+    if (!req->mode_encoder)
+    {
+        fovt_p("No Encoder Found!\r\n");
+        goto no_encoder;
+    }
+
+    // find a CRTC
+    if (req->mode_encoder->crtc_id) {
+        req->mode_crtc = drmModeGetCrtc(fd, req->mode_encoder->crtc_id);
+    }
+
+    // save the crtc_id
+    req->crtc_id = req->mode_crtc->crtc_id;
+
+    return 0;
+no_encoder:
+    drmModeFreeEncoder(req->mode_encoder);
+    drmModeFreeConnector(req->mode_conn);
+no_conn:
+    drmModeFreeResources(req->mode_res);
+    return -1;
+
+
+
+}
+
+
 struct gbm_device *gbm_dev_create(bool master)
 {
-	struct gbm_device *gbm;
-	char card_path[128] = "/dev/dri/card1";
-	char render_path[128] = "/dev/dri/renderD128";
+    struct gbm_device *gbm;
+    char card_path[128] = "/dev/dri/card1";
+    char render_path[128] = "/dev/dri/renderD128";
     char *path = NULL;
-	int fd;
+    int fd;
 
     fovt_p("%s \n", master ? card_path : render_path);
     fd = open(master ? card_path : render_path, O_RDWR | O_CLOEXEC);
@@ -591,6 +662,7 @@ int ConvertBoInfo(struct gralloc_handle_t *handle, struct hwc_drm_bo *bo)
     bo->prime_fds[0] = handle->prime_fd;
     bo->pitches[0] = handle->stride;
     bo->offsets[0] = 0;
+    return 0;
 }
 
 static uint32_t get_property_id(int fd, drmModeObjectProperties *object_props,
